@@ -1,0 +1,93 @@
+name: Validate project-filtered note searches
+
+on:
+  push:
+    branches: [qualify/project-note-search-diagnostics-20261017]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-project-notes-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-required-gates:
+    if: github.repository == 'rudycelekli/talorys'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      TALORYS_ENV: "development"
+      TALORYS_MOCK_AI: "1"
+      WRANGLER_SEND_METRICS: "false"
+      DO_NOT_TRACK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 209a8e24bfc59ebcf9a4d4c8e0e821834b47ae03
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact source, tree and parent
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 209a8e24bfc59ebcf9a4d4c8e0e821834b47ae03
+          test "$(git rev-parse 'HEAD^{tree}')" = 40144d85b381b737d57eccc736c2da8cd0714fd3
+          test "$(git rev-parse 'HEAD^')" = 06f1d64adf01354b76d71326fc4977a518444af0
+          git log -1 --format='%H %T %P'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Prove native API regressions fail on the main repository source
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=apps/agent/src/db/repositories/notes.ts
+          cp "$target" "$RUNNER_TEMP/reviewed-notes.ts"
+          trap 'cp "$RUNNER_TEMP/reviewed-notes.ts" "$target"' EXIT
+          git show '8a5d8a84eeae2bd07d6c0250e7d23e8d76760f0e:apps/agent/src/db/repositories/notes.ts' > "$target"
+          set +e
+          npm exec --workspace @talorys/agent -- vitest run test/notes-project-search.test.ts --reporter=json --outputFile="$RUNNER_TEMP/notes-baseline.json"
+          baseline_exit=$?
+          set -e
+          test "$baseline_exit" = 1
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {readFileSync} from 'node:fs';
+          import {createHash} from 'node:crypto';
+          const bytes=readFileSync(process.env.RUNNER_TEMP+'/notes-baseline.json');
+          const report=JSON.parse(bytes);
+          assert.equal(report.numTotalTests,2);
+          assert.equal(report.numFailedTests,2);
+          assert.equal(report.numPassedTests,0);
+          const failed=report.testResults.flatMap(s=>s.assertionResults).filter(t=>t.status==='failed');
+          assert.equal(failed.length,2);
+          for(const test of failed) {
+            assert.match(test.fullName,/project-filtered note search.*combines the project and query filters/);
+            const message=test.failureMessages.join('\n').replace(/\u001b\[[0-9;]*m/g,'');
+            console.log(JSON.stringify({baselineAssertion:test.fullName,failureMessages:test.failureMessages}));
+            assert.match(message,/AssertionError: [\s\S]*expected[\s\S]*to deeply equal/);
+            assert.match(message,/notes-project-search\.test\.ts:21:/);
+            const diagnostic=message.match(/(\{"query":[^\n]*?\}): expected/);
+            assert.ok(diagnostic,'expected fixture diagnostic in actual native assertion message');
+            const observed=JSON.parse(diagnostic[1]);
+            assert.equal(observed.expected.length,1);
+            assert.ok(observed.actual.includes(observed.expected[0]));
+            const outside=new Set(observed.actual.filter(id=>!observed.expected.includes(id)));
+            assert.ok(outside.size>=2,'expected two out-of-project note IDs in actual queried results');
+            assert.match(observed.project,/^[0-9a-f-]{36}$/i);
+            for(const id of [...observed.actual,...observed.expected]) assert.match(id,/^[0-9a-f-]{36}$/i);
+            assert.ok(observed.query==='%' || /^tomato[0-9a-f]{32}$/i.test(observed.query));
+          }
+          console.log(JSON.stringify({baseline:'main notes repository with candidate API tests',total:report.numTotalTests,failed:report.numFailedTests,sha256:createHash('sha256').update(bytes).digest('hex'),failures:failed.map(t=>({name:t.fullName,messages:t.failureMessages}))}));
+          NODE
+          cp "$RUNNER_TEMP/reviewed-notes.ts" "$target"
+          trap - EXIT
+          git diff --exit-code
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
