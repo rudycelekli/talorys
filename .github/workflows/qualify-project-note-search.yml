@@ -1,0 +1,87 @@
+name: Validate project-filtered note searches
+
+on:
+  push:
+    branches: [qualify/project-note-search-20261017]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-project-notes-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-required-gates:
+    if: github.repository == 'rudycelekli/talorys'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      TALORYS_ENV: "development"
+      TALORYS_MOCK_AI: "1"
+      WRANGLER_SEND_METRICS: "false"
+      DO_NOT_TRACK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 06f1d64adf01354b76d71326fc4977a518444af0
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact source, tree and parent
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 06f1d64adf01354b76d71326fc4977a518444af0
+          test "$(git rev-parse 'HEAD^{tree}')" = 8501f1e694b6b1446c5670f43c148c9d88ff150c
+          test "$(git rev-parse 'HEAD^')" = 8a5d8a84eeae2bd07d6c0250e7d23e8d76760f0e
+          git log -1 --format='%H %T %P'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Prove native API regressions fail on the main repository source
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=apps/agent/src/db/repositories/notes.ts
+          cp "$target" "$RUNNER_TEMP/reviewed-notes.ts"
+          trap 'cp "$RUNNER_TEMP/reviewed-notes.ts" "$target"' EXIT
+          git show '8a5d8a84eeae2bd07d6c0250e7d23e8d76760f0e:apps/agent/src/db/repositories/notes.ts' > "$target"
+          set +e
+          npm exec --workspace @talorys/agent -- vitest run test/notes-project-search.test.ts --reporter=json --outputFile="$RUNNER_TEMP/notes-baseline.json"
+          baseline_exit=$?
+          set -e
+          test "$baseline_exit" = 1
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {readFileSync} from 'node:fs';
+          import {createHash} from 'node:crypto';
+          const bytes=readFileSync(process.env.RUNNER_TEMP+'/notes-baseline.json');
+          const report=JSON.parse(bytes);
+          assert.equal(report.numTotalTests,2);
+          assert.equal(report.numFailedTests,2);
+          assert.equal(report.numPassedTests,0);
+          const failed=report.testResults.flatMap(s=>s.assertionResults).filter(t=>t.status==='failed');
+          assert.equal(failed.length,2);
+          for(const test of failed) {
+            assert.match(test.fullName,/project-filtered note search.*combines the project and query filters/);
+            const message=test.failureMessages.join('\n').replace(/\u001b\[[0-9;]*m/g,'');
+            console.log(JSON.stringify({baselineAssertion:test.fullName,failureMessages:test.failureMessages}));
+            assert.match(message,/AssertionError: expected[\s\S]*to deeply equal/);
+            assert.match(message,/notes-project-search\.test\.ts:20:/);
+            // The failing line compares returned note IDs with the one selected-project ID.
+            // Three distinct UUIDs in its equality diff prove extra note IDs were returned.
+            const noteIds=new Set(message.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? []);
+            assert.ok(noteIds.size>=3,'expected selected plus two out-of-project note IDs in filtered-results assertion');
+          }
+          console.log(JSON.stringify({baseline:'main notes repository with candidate API tests',total:report.numTotalTests,failed:report.numFailedTests,sha256:createHash('sha256').update(bytes).digest('hex'),failures:failed.map(t=>({name:t.fullName,messages:t.failureMessages}))}));
+          NODE
+          cp "$RUNNER_TEMP/reviewed-notes.ts" "$target"
+          trap - EXIT
+          git diff --exit-code
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
